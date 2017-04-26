@@ -1,0 +1,326 @@
+
+
+/*----------------------------------------------------------------------
+说明：可以一次性将同目录下的多个BAK文件进行还原(还原前有无数据库都可以)
+1.修复了数据库在使用时不能还原的问题。
+2.修复了一个BAK文件有多个备份集时不能还原的问题。
+(一个BAK文件有多个备份集时，取最后一个备份集来还原)
+3.修复了不支持sql 2012的问题。
+4.自动判断SQL 版本
+-------------------------------------------------------------------------*/
+USE master
+GO
+
+DECLARE	@bkpath NVARCHAR(1000),@bkfile NVARCHAR(4000), @dbpath NVARCHAR(260), @overexist BIT,@killuser BIT,@SQLVersion INT;
+
+-- BAK 文件所在路径
+SET	@bkpath      = 'G:\DBbak-20160401';   
+ 
+-- 还原后的数据库存放目录,不指定则为SQL的默认数据目录
+SET @dbpath	     = 'E:\V3.4.4_DB\';  
+
+
+--------------------- 以下变量值默认就好 ------------------------------------
+SET	@bkfile      = '';    -- 定义要恢复的备份文件名,不含扩展名
+SET @overexist	 = 1;     -- 是否覆盖已经存在的数据库,仅@retype为'DB'/'DBNOR'是有效
+SET @killuser	 = 1;     -- 是否关闭用户使用进程,仅@overexist=1时有效
+
+-- 自动判断SQL 版本
+--SET @SQLVersion	 = 1;	  -- 1:SQL Server 2005;   2: SQL Server 2008;    3:SQL Server 2012 
+
+IF @@VERSION LIKE '%Server 2005%'
+BEGIN
+	SET @SQLVersion = 1;
+END
+ELSE IF @@VERSION LIKE '%Server 2008%'
+BEGIN
+	SET @SQLVersion = 2;
+END
+ELSE IF @@VERSION LIKE '%Server 2012%'
+BEGIN
+	SET @SQLVersion = 3;
+END
+ELSE -- sql server 2014或以后版本
+BEGIN
+	SET @SQLVersion = 3;
+END
+
+
+DECLARE @sql VARCHAR(8000),@dbname sysname;
+
+-- 备份文件所在目录
+IF ISNULL(@bkpath,'') = ''
+BEGIN
+	SELECT @bkpath = RTRIM(REVERSE([filename])) 
+	FROM [master].[dbo].[sysfiles] 
+	WHERE	[name] = 'master';
+	
+	SELECT 
+		@bkpath = SUBSTRING(@bkpath,CHARINDEX('\',@bkpath) + 1,4000),
+		@bkpath = REVERSE(SUBSTRING(@bkpath,CHARINDEX('\',@bkpath),4000)) + 'BACKUP\';
+END
+ELSE IF RIGHT(@bkpath,1) <> '\' 
+BEGIN
+	SET @bkpath = @bkpath + '\';
+END
+
+-- 得到恢复后的数据库存放目录
+IF ISNULL(@dbpath,'') = ''
+BEGIN
+	SELECT @dbpath = RTRIM(REVERSE([filename])) 
+	FROM [master].[dbo].[sysfiles] 
+	WHERE	[name] = 'master';
+	SELECT @dbpath = REVERSE(SUBSTRING(@dbpath,CHARINDEX('\',@dbpath),4000));
+END
+ELSE IF RIGHT(@dbpath,1) <> '\' 
+BEGIN 
+	SET @dbpath = @dbpath + '\';
+END
+
+-- 创建临时表,保存获取的信息
+CREATE TABLE #tb
+(
+	ln	nvarchar(128),  --逻辑名称
+	pn	nvarchar(260),  --物理路径	
+	tp	char(1),		--文件类型（D:数据文件，L：日志文件）		   	
+	fgn nvarchar(128),	--文件组名称
+	sz	numeric(20,0),	--文件大小
+	Msz numeric(20,0)	--最大文件大小
+);
+
+--从备份文件中获取信息
+CREATE TABLE #TFileInfo
+(
+	LogicalName		nvarchar(128),  --逻辑名称
+	PhysicalName	nvarchar(260),  --物理路径	
+	[Type]			char(1),		--文件类型（D:数据文件，L：日志文件）		   	
+	FileGroupName	nvarchar(128),	--文件组名称
+	Size			numeric(20,0),	--文件大小
+	MaxSize			numeric(20,0),	--最大文件大小
+	FileId			VARCHAR(10),
+	CreateLSN		VARCHAR(100),
+	DropLSN			VARCHAR(100),
+	UniqueId		VARCHAR(100),
+	ReadOnlyLSN		VARCHAR(100),
+	ReadWriteLSN	VARCHAR(100),
+	BackupSizeInBytes INT,	
+	SourceBlockSize	INT,
+	FileGroupId		INT,
+	LogGroupGUID	uniqueidentifier,
+	DifferentialBaseLSN	VARCHAR(100),
+	DifferentialBaseGUID VARCHAR(100),
+	IsReadOnly		BIT,
+	IsPresent		BIT
+	
+)
+
+
+--备份文件基本信息表（包含数据库名）
+CREATE TABLE #TBackInfo
+(
+	BackupName			NVARCHAR(128),
+	BackupDescription	NVARCHAR(255),
+	BackupType			SMALLINT,
+	ExpirationDate		DATETIME,
+	Cormpressed			BIT,
+	Position			SMALLINT,
+	DeviceType			TINYINT,
+	UserName			NVARCHAR(128),
+	ServerName			NVARCHAR(128),
+	DatabaseName		NVARCHAR(128),	--数据库名
+	DatabaseVersion		INT,
+	DatabaseCreationDate DATETIME,
+	BackupSize			NUMERIC(20,0),
+	FirstLSN			NUMERIC(25,0),
+	LastLSN				NUMERIC(25,0),
+	CheckpointLSN		NUMERIC(25,0),
+	DatabaseBackupLSN	NUMERIC(25,0),
+	BackupStartDate		DATETIME,
+	BackupFinishDate	DATETIME,
+	SortOrder			SMALLINT,
+	[CodePage]			SMALLINT,
+	UnicodeLocaleId		INT,
+	UnicodeComparisonStyle INT,
+	CompatibilityLevel	TINYINT,
+	SoftwareVendorld	INT,
+	SoftwareVersionMajor INT,
+	SoftwareVersionMinor INT,
+	SoftwareVersionBuild INT,
+	MachineName			NVARCHAR(128),
+	Flags				INT,
+	BindingID			UNIQUEIDENTIFIER,
+	RecoveryForkID		UNIQUEIDENTIFIER,
+	Collation			NVARCHAR(128),
+	FamilyGUID			UNIQUEIDENTIFIER,
+	HasBulkLoggedData	BIT,
+	IsSnapshot			BIT,
+	IsReadOnly			BIT,
+	IsSingleUser		BIT,
+	HasBackupChecksums	BIT,
+	IsDamaged			BIT,
+	BeginsLogChain		BIT,
+	HasIncompleteMetaData BIT,
+	IsForceOffline		BIT,
+	IsCopyOnly			BIT,
+	FirstRecoveryForkID	UNIQUEIDENTIFIER,
+	ForkPointLSN		NUMERIC(25,0),
+	RecoveryModel		NVARCHAR(60),
+	DifferentialBaseLSN	NUMERIC(25,0),
+	DifferentialBaseGUID UNIQUEIDENTIFIER,
+	BackupTypeDescription NVARCHAR(60),
+	BackupSetGUID		UNIQUEIDENTIFIER
+);
+
+IF(@SQLVersion > 1) -- 非 sql server 2005
+BEGIN
+	-- TDEThumbprint	VARCHAR(100)  -- SQL2008里有，SQL2005里没有，注释它规避语法错误
+	ALTER TABLE #TFileInfo ADD TDEThumbprint VARCHAR(100);
+	-- CompressedBackupSize BIGINT  --SQL2008里有，SQL2005里没有，注释它规避语法错误
+	ALTER TABLE #TBackInfo ADD CompressedBackupSize BIGINT;
+END
+
+IF(@SQLVersion = 3) -- sql server 2012
+BEGIN
+	-- Containment BIGINT  --SQL2012里有
+	ALTER TABLE #TBackInfo ADD Containment INT;
+END
+
+
+-- 得到指定目录下的所有备份文件
+CREATE TABLE #t
+(
+	fname varchar(260),
+	depth int,
+	isf BIT
+)
+
+INSERT INTO #t EXEC master..xp_dirtree @bkpath,1,1;
+
+IF ISNULL(@bkfile,'') = ''
+BEGIN
+    DECLARE CTB CURSOR LOCAL
+    FOR
+        SELECT  fn = LEFT(fname, PATINDEX('%.bak', fname) - 1)
+        FROM    #t
+        WHERE   isf = 1
+                AND fname LIKE '%.bak';  --取.bak文件
+END
+ELSE
+BEGIN
+	SET @bkfile = ',' + REPLACE(@bkfile,',','.bak,') + '.bak,';
+    DECLARE CTB CURSOR LOCAL
+    FOR
+        SELECT  fn = LEFT(fname, PATINDEX('%.bak', fname) - 1) 
+	FROM #t
+	WHERE isf = 1 AND fname like '%.bak' and @bkfile like '%,'+fname+',%';
+END
+
+-- 恢复数据库处理
+OPEN CTB
+FETCH NEXT FROM CTB INTO @dbname
+WHILE  @@fetch_status = 0
+BEGIN
+	-- 获取数据库名
+	DECLARE @DataBaseName sysname,@file_index INT;
+	-- 要还原的完整数据库备份是设备上的第1个备份集
+	SET @file_index = 1;
+	-- RESTORE HEADERONLY:返回包含特定备份设备上所有备份集的所有备份标头信息的结果集。
+
+	TRUNCATE TABLE #TBackInfo;
+	INSERT INTO #TBackInfo
+    EXEC('RESTORE HEADERONLY FROM DISK =''' + @bkpath + @dbname + '.bak''');
+		
+	-- 可能有多个备份集，取最后一个备份集	
+	SELECT TOP	1 @DataBaseName = DatabaseName,@file_index = [Position]
+	FROM #TBackInfo ORDER BY [Position] DESC;
+
+
+	
+	
+	-- 生成数据库恢复语句
+	-- RESTORE DATABASE [TEST] FROM DISK = 'D:\Git\TEST.bak' WITH FILE = 5,RECOVERY,REPLACE
+    SET @sql = 'RESTORE DATABASE [' + @DataBaseName + '] FROM DISK = '''
+        + @bkpath + @dbname + '.bak''' + '  WITH FILE = ' + LTRIM(@file_index) + ',RECOVERY'
+        + CASE WHEN @overexist = 1 THEN ',REPLACE'
+               ELSE ''
+          END;
+
+	-- 添加移动逻辑文件的处理
+	-- 从备份文件中获取逻辑文件名
+    DECLARE @lfn NVARCHAR(128) ,@tp CHAR(1) ,@i INT;
+
+	-- RESTORE FILELISTONLY:用此语句得到备份文件的逻辑文件名
+
+	TRUNCATE TABLE #TFileInfo;
+	INSERT INTO #TFileInfo
+    EXEC('RESTORE FILELISTONLY FROM DISK = ''' + @bkpath + @dbname + '.bak''');
+		
+	TRUNCATE TABLE #tb;
+
+	INSERT INTO #tb( ln, pn, tp, fgn, sz, Msz )
+	SELECT LogicalName,PhysicalName,[Type],FileGroupName,Size,MaxSize
+	FROM #TFileInfo;
+
+	
+    
+    DECLARE #f CURSOR LOCAL
+    FOR SELECT  ln , tp FROM    #tb ORDER BY tp;
+	OPEN #f;
+    FETCH NEXT FROM #f INTO @lfn, @tp;
+	SET @i = 0;
+	WHILE @@fetch_status = 0
+	BEGIN
+        SELECT  @sql = @sql + ',move ''' + @lfn + ''' to ''' + @dbpath
+                + @DataBaseName + CASE @tp
+                                    WHEN 'D' THEN '.mdf'''
+                                    ELSE '_log.ldf'''
+                                  END ,
+                @i = @i + 1;
+        FETCH NEXT FROM #f INTO @lfn, @tp
+	END
+    CLOSE #f
+    DEALLOCATE #f
+ 
+	-- 关闭用户进程处理
+	IF @overexist = 1 AND @killuser = 1
+	BEGIN
+		DECLARE @KillSQL VARCHAR(MAX);
+
+		-- 只要有该数据库对应的会话，就结束掉
+		WHILE EXISTS(SELECT * FROM [master].dbo.[sysprocesses] WHERE [dbid] = DB_ID(@DataBaseName))
+		BEGIN
+			SET @KillSQL = '';
+			SELECT  @KillSQL = 'KILL ' + CAST(spid AS VARCHAR) + ';'
+			FROM [master].dbo.[sysprocesses]
+			WHERE [dbid] = DB_ID(@DataBaseName);
+
+			IF @KillSQL > ''
+			BEGIN
+				EXEC(@KillSQL);
+			END
+		END
+		 
+		
+        --DECLARE hCForEach CURSOR
+        --FOR
+        --    SELECT  s = 'kill ' + CAST(spid AS VARCHAR)
+        --    FROM    master..sysprocesses
+        --    WHERE   dbid = DB_ID(@dbname)
+        --EXEC sp_msforeach_worker '?'
+	END
+	
+	-- 恢复数据库
+    EXEC(@sql);
+	
+    FETCH NEXT FROM CTB INTO @dbname
+END
+CLOSE CTB
+DEALLOCATE CTB
+
+-- 删除临时表
+DROP TABLE #tb;
+DROP TABLE #t;
+
+DROP TABLE #TFileInfo;
+DROP TABLE #TBackInfo;
+
